@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.parts/
+*.parts_single
+下载日志.txt
