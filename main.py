@@ -19,9 +19,9 @@ from urllib.parse import urlparse
 from PyQt5.QtCore import QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter
 from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QProgressBar, QPushButton, QSizePolicy, QSpinBox,
-    QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QProgressBar,
+    QPushButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 
@@ -572,6 +572,15 @@ QProgressBar::chunk { border-radius:7px;
 #Seg { background:#0e1526; border:none; border-radius:4px; }
 #Seg::chunk { background:#4f8cff; border-radius:2px; }
 QSpinBox::up-button, QSpinBox::down-button { width:14px; background:#16203a; border:none; }
+QListWidget {
+    background:#0d1426; border:1px solid #26304d; border-radius:9px;
+    padding:4px; color:#cfe0ff; font-size:12px; outline:0; }
+QListWidget::item { padding:5px 7px; border-radius:6px; }
+QListWidget::item:hover { background:#16203a; }
+QListWidget::item:selected { background:#1d2f52; color:#ffffff; }
+QScrollBar:vertical { background:transparent; width:10px; margin:2px; }
+QScrollBar::handle:vertical { background:#2a3a5c; border-radius:5px; min-height:24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
 """
 
 
@@ -583,6 +592,10 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.probe_size = -1
         self.probe_ranges = False
+        self.probe_url = ""          # 这批 size/ranges 是属于哪个链接的
+        self.name_auto = False       # 文件名是不是探测时自动填的
+        self.queue_running = False
+        self.queue_cur = None
         self.last_done = 0
         self.last_ts = 0.0
         self.speed = 0.0
@@ -632,6 +645,7 @@ class MainWindow(QMainWindow):
         self.ed_url = QLineEdit()
         self.ed_url.setPlaceholderText("粘贴下载链接（http:// 或 https://）")
         self.ed_url.returnPressed.connect(self.on_probe)
+        self.ed_url.textChanged.connect(self.on_url_changed)
         self.btn_probe = QPushButton("探测")
         self.btn_probe.setObjectName("Primary")
         self.btn_probe.clicked.connect(self.on_probe)
@@ -687,6 +701,9 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_start)
         row.addWidget(self.btn_cancel)
         row.addWidget(self.btn_reveal)
+        self.btn_queue_toggle = QPushButton("批量…")
+        self.btn_queue_toggle.clicked.connect(self.toggle_queue)
+        row.addWidget(self.btn_queue_toggle)
         row.addStretch(1)
         self.lb_size = QLabel("—")
         self.lb_size.setObjectName("Hint")
@@ -747,6 +764,42 @@ class MainWindow(QMainWindow):
         pv.addWidget(self.lb_msg)
 
         outer.addWidget(pc)
+
+        # 队列卡片（默认收起）
+        self.qcard = QFrame()
+        self.qcard.setObjectName("Card")
+        qv = QVBoxLayout(self.qcard)
+        qv.setContentsMargins(18, 14, 18, 14)
+        qv.setSpacing(8)
+        qtitle = QLabel("下载队列 · 按顺序一个个跑")
+        qtitle.setObjectName("FormLabel")
+        qv.addWidget(qtitle)
+        self.qlist = QListWidget()
+        self.qlist.setFixedHeight(82)
+        qv.addWidget(self.qlist)
+        qrow = QHBoxLayout()
+        qrow.setSpacing(8)
+        b1 = QPushButton("加入当前链接")
+        b1.clicked.connect(self.on_queue_add_current)
+        b2 = QPushButton("批量粘贴")
+        b2.clicked.connect(self.on_queue_paste)
+        b3 = QPushButton("移除选中")
+        b3.clicked.connect(self.on_queue_remove)
+        b4 = QPushButton("清空")
+        b4.clicked.connect(self.on_queue_clear)
+        self.btn_queue_start = QPushButton("开始队列")
+        self.btn_queue_start.setObjectName("Primary")
+        self.btn_queue_start.clicked.connect(self.on_queue_start)
+        self.btn_queue_stop = QPushButton("停止队列")
+        self.btn_queue_stop.setObjectName("Danger")
+        self.btn_queue_stop.setEnabled(False)
+        self.btn_queue_stop.clicked.connect(self.on_queue_stop)
+        for b in (b1, b2, b3, b4, self.btn_queue_start, self.btn_queue_stop):
+            qrow.addWidget(b)
+        qrow.addStretch(1)
+        qv.addLayout(qrow)
+        self.qcard.setVisible(False)
+        outer.addWidget(self.qcard)
         outer.addStretch(1)
 
     def make_stat(self, layout, key):
@@ -778,6 +831,16 @@ class MainWindow(QMainWindow):
         os.makedirs(path, exist_ok=True)
         os.startfile(path)
 
+    def on_url_changed(self, text):
+        """换了链接就把上一次的探测结果作废，免得拿旧尺寸当新文件下。"""
+        if text.strip() == self.probe_url:
+            return
+        self.probe_size, self.probe_ranges, self.probe_url = -1, False, ""
+        self.lb_size.setText("—")
+        if self.name_auto:
+            self.name_auto = False
+            self.ed_name.clear()
+
     def on_probe(self):
         url = self.ed_url.text().strip()
         if not url.lower().startswith(("http://", "https://")):
@@ -798,9 +861,10 @@ class MainWindow(QMainWindow):
             self.note("探测失败：%s（可能是链接过期、需要登录，或者网络被墙）" % exc)
             return
         self.btn_probe.setEnabled(True)
-        self.probe_size, self.probe_ranges = size, ranges
+        self.probe_size, self.probe_ranges, self.probe_url = size, ranges, url
         if name and not self.ed_name.text().strip():
             self.ed_name.setText(name)
+            self.name_auto = True
         self.btn_start.setEnabled(True)
         txt = human(size) if size > 0 else "未知"
         self.lb_size.setText("%s · %s" % (txt, "可分段" if ranges else "单线程"))
@@ -810,6 +874,28 @@ class MainWindow(QMainWindow):
         url = self.ed_url.text().strip()
         if not url:
             return
+        if url != self.probe_url:
+            # 换了新链接但没点探测：这里补一次，避免用旧尺寸去下
+            self.note("新链接，先探测一下…")
+            self.lb_size.setText("—")
+            QApplication.processEvents()
+            try:
+                size, ranges, name = probe(url, self.ed_proxy.text().strip())
+            except Throttled as exc:
+                self.note("探测被限流（HTTP %s），等一会儿再试。" % exc.code)
+                return
+            except FatalHTTP as exc:
+                self.note("探测失败：" + http_hint(exc.code))
+                return
+            except Exception as exc:
+                self.note("探测失败：%s" % exc)
+                return
+            self.probe_size, self.probe_ranges, self.probe_url = size, ranges, url
+            if name and (self.name_auto or not self.ed_name.text().strip()):
+                self.ed_name.setText(name)
+                self.name_auto = True
+            self.lb_size.setText("%s · %s" % (
+                human(size) if size > 0 else "未知", "可分段" if ranges else "单线程"))
         out_dir = self.ed_dir.text().strip() or DEFAULT_DIR
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -850,6 +936,124 @@ class MainWindow(QMainWindow):
         if self.worker and os.path.exists(self.worker.out):
             os.system('explorer /select,"%s"' % os.path.normpath(self.worker.out))
 
+    # ---------------- 队列 ----------------
+    def toggle_queue(self):
+        vis = not self.qcard.isVisible()
+        self.qcard.setVisible(vis)
+        self.btn_queue_toggle.setText("收起队列" if vis else "批量…")
+        self.resize(self.width(), 800 if vis else 640)
+
+    def queue_add(self, urls):
+        added = 0
+        for u in urls or []:
+            u = (u or "").strip()
+            if not u.lower().startswith(("http://", "https://")):
+                continue
+            it = QListWidgetItem("[等待] " + u)
+            it.setData(Qt.UserRole, u)
+            it.setData(Qt.UserRole + 1, "waiting")
+            self.qlist.addItem(it)
+            added += 1
+        if added:
+            self.fit_queue_height()
+            self.note("队列里共 %d 个任务。" % self.qlist.count())
+        else:
+            self.note("没找到可用的 http(s) 链接。")
+
+    def on_queue_add_current(self):
+        self.queue_add([self.ed_url.text()])
+
+    def on_queue_paste(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "批量添加", "每行一个链接：", "")
+        if ok and text.strip():
+            self.queue_add(text.splitlines())
+
+    def fit_queue_height(self):
+        n = self.qlist.count()
+        self.qlist.setFixedHeight(max(88, min(140, 14 + 28 * max(n, 2))))
+
+    def on_queue_remove(self):
+        for it in self.qlist.selectedItems():
+            self.qlist.takeItem(self.qlist.row(it))
+        self.fit_queue_height()
+
+    def on_queue_clear(self):
+        if self.queue_running:
+            self.note("队列正在跑，先点「停止队列」。")
+            return
+        self.qlist.clear()
+        self.fit_queue_height()
+        self.note("队列已清空。")
+
+    def on_queue_start(self):
+        if self.qlist.count() == 0:
+            self.note("队列是空的，先加几个链接。")
+            return
+        if self.worker and self.worker.isRunning():
+            self.note("当前还有下载在跑，等它结束再开队列。")
+            return
+        # 允许重跑：把非 running 的标记复位
+        for i in range(self.qlist.count()):
+            it = self.qlist.item(i)
+            if it.data(Qt.UserRole + 1) != "done":
+                it.setData(Qt.UserRole + 1, "waiting")
+                it.setText("[等待] " + it.data(Qt.UserRole))
+        self.queue_running = True
+        self.btn_queue_start.setEnabled(False)
+        self.btn_queue_stop.setEnabled(True)
+        self.note("队列开始。")
+        self.queue_next()
+
+    def on_queue_stop(self):
+        self.queue_running = False
+        self.btn_queue_start.setEnabled(True)
+        self.btn_queue_stop.setEnabled(False)
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+        self.note("队列已停止（当前任务正在收尾）。")
+
+    def _queue_mark(self, status, label):
+        if self.queue_cur is None:
+            return
+        it = self.queue_cur
+        it.setData(Qt.UserRole + 1, status)
+        it.setText("[%s] %s" % (label, it.data(Qt.UserRole)))
+        self.queue_cur = None
+
+    def queue_finished(self, state):
+        label = {"done": "完成", "error": "失败", "cancelled": "已停止"}.get(state, state)
+        st = "done" if state == "done" else ("failed" if state == "error" else "waiting")
+        self._queue_mark(st, label)
+        QTimer.singleShot(400, self.queue_next)
+
+    def queue_next(self):
+        if not self.queue_running:
+            return
+        nxt = None
+        for i in range(self.qlist.count()):
+            it = self.qlist.item(i)
+            if it.data(Qt.UserRole + 1) == "waiting":
+                nxt = it
+                break
+        if nxt is None:
+            self.queue_running = False
+            self.queue_cur = None
+            self.btn_queue_start.setEnabled(True)
+            self.btn_queue_stop.setEnabled(False)
+            self.note("队列全部跑完。")
+            return
+        self.queue_cur = nxt
+        nxt.setData(Qt.UserRole + 1, "running")
+        nxt.setText("[下载中] " + nxt.data(Qt.UserRole))
+        self.qlist.scrollToItem(nxt)
+        url = nxt.data(Qt.UserRole)
+        self.name_auto = False
+        self.ed_name.clear()
+        self.probe_size, self.probe_ranges, self.probe_url = -1, False, ""
+        self.ed_url.setText(url)
+        self.on_start()
+
     def build_seg_bars(self, n):
         self.seg_strip.set_count(max(1, int(n)))
 
@@ -882,7 +1086,9 @@ class MainWindow(QMainWindow):
         if w.state in ("done", "error", "cancelled"):
             self.timer.stop()
             self.btn_cancel.setEnabled(False)
-            self.btn_start.setEnabled(True)
+            self.btn_start.setEnabled(not self.queue_running)
+            if self.queue_running:
+                self.queue_finished(w.state)
             if w.state == "done":
                 self.lb_phase.setText("完成")
                 self.btn_reveal.setEnabled(True)
